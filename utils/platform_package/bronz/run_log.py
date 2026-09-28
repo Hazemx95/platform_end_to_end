@@ -96,14 +96,14 @@ class RunLogRepository:
             )
             return {row[0] for row in cursor.fetchall()}
 
-    def success(self, run_id: UUID, files: list[str], rows: int, watermark: datetime | None, columns: list[str]):
+    def success(self, run_id: UUID, files: list[str], rows: int, corrupt_rows: int, watermark: datetime | None, columns: list[str]):
         """Finish a Run with its Source Files, counts and reached Watermark."""
         with self._cursor() as cursor:
             cursor.execute(
                 sql.SQL("""UPDATE {} SET status = %s, finished_at = now(),
-                    files_loaded = %s, rows_read = %s, rows_written = %s,
+                    files_loaded = %s, rows_read = %s, rows_written = %s, corrupt_rows = %s,
                     watermark_value = %s, schema_columns = %s WHERE run_id = %s""").format(self.table),
-                (RunStatus.SUCCESS.value, files, rows, rows, watermark, Json(columns), str(run_id)),
+                (RunStatus.SUCCESS.value, files, rows, rows, corrupt_rows, watermark, Json(columns), str(run_id)),
             )
 
     def fail(self, run_id: UUID, error: str):

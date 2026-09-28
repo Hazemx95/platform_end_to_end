@@ -47,6 +47,39 @@ def run_details(settings, schema, run_ids):
             return {str(row[0]): row[1:] for row in cursor.fetchall()}
 
 
+def run_corrupt_rows(settings, schema, run_ids):
+    with psycopg2.connect(**settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("SELECT run_id, corrupt_rows FROM {}.bronze_run_log WHERE run_id = ANY(%s::uuid[])").format(sql.Identifier(schema)),
+                ([str(run_id) for run_id in run_ids],),
+            )
+            return {str(run_id): count for run_id, count in cursor.fetchall()}
+
+
+def test_malformed_source_row_is_kept_and_counted_in_successful_run(tmp_path, spark, run_log_db):
+    settings, schema = run_log_db
+    source_root, destination = tmp_path / "source", tmp_path / "bronze"
+    write_source_file(source_root, "source_erp", "LOC_A101", "delivery.csv", "id,country\nA1,US\nA3,US,EXTRA\n", 1_700_000_000_123_456_789)
+
+    run = ingest(source_root, destination, settings, schema, "LOC_A101", spark)[0]
+
+    assert run.status == "SUCCESS", run.error_message
+    assert run_corrupt_rows(settings, schema, [run.run_id]) == {str(run.run_id): 1}
+    assert run_details(settings, schema, [run.run_id])[str(run.run_id)][2] == 2
+    bronze = spark.read.option("mergeSchema", "true").parquet(str(destination / "source_erp" / "LOC_A101"))
+    rows = {row["id"]: row for row in bronze.collect()}
+    assert len(rows) == 2
+    assert rows["A1"]["_corrupt_record"] is None
+    assert rows["A3"]["_corrupt_record"] == "A3,US,EXTRA"
+    for row in rows.values():
+        assert row["_run_id"] == str(run.run_id)
+        assert row["_source_system"] == "source_erp"
+        assert row["_source_table"] == "LOC_A101"
+        assert row["_source_file"] == "delivery.csv"
+        assert row["_ingested_at"] is not None
+
+
 def test_idle_run_carries_watermark_and_schema_without_partition(tmp_path, spark, run_log_db):
     settings, schema = run_log_db
     source_root = tmp_path / "source"
@@ -61,6 +94,9 @@ def test_idle_run_carries_watermark_and_schema_without_partition(tmp_path, spark
     details = run_details(settings, schema, [first.run_id, idle.run_id])
     assert details[str(first.run_id)] == ("SUCCESS", ["first.csv"], 1, expected_watermark(mtime_ns), ["id", "name"])
     assert details[str(idle.run_id)] == ("SUCCESS", [], 0, expected_watermark(mtime_ns), ["id", "name"])
+    assert run_corrupt_rows(settings, schema, [first.run_id, idle.run_id]) == {
+        str(first.run_id): 0, str(idle.run_id): 0,
+    }
     table_root = destination / "source_crm" / "cust_info"
     assert len(list(table_root.glob("_run_id=*"))) == 1
     assert [(row["id"], row["_source_file"]) for row in spark.read.option("mergeSchema", "true").parquet(str(table_root)).collect()] == [("1", "first.csv")]

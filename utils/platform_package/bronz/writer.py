@@ -36,12 +36,16 @@ def read_source_files(spark: SparkSession, files: list[Path], table: SourceTable
     return combined, columns
 
 
-def write_bronze_run(frame: DataFrame | None, destination_root: Path, table: SourceTable, run_id: str) -> int:
+def write_bronze_run(frame: DataFrame | None, destination_root: Path, table: SourceTable, run_id: str) -> tuple[int, int]:
     """Store a Run in its own Bronze Layer partition (without a stored _run_id)."""
     if frame is None:
-        return 0
-    rows = frame.count()
-    if rows:
-        partition = destination_root / table.source_system / table.source_table / f"_run_id={run_id}"
-        frame.write.mode("errorifexists").parquet(str(partition))
-    return rows
+        return 0, 0
+    frame = frame.persist()
+    try:
+        counts = frame.agg(F.count("*").alias("total"), F.count("_corrupt_record").alias("corrupt")).first()
+        if counts.total:
+            partition = destination_root / table.source_system / table.source_table / f"_run_id={run_id}"
+            frame.write.mode("errorifexists").parquet(str(partition))
+        return counts.total, counts.corrupt
+    finally:
+        frame.unpersist()

@@ -70,11 +70,11 @@ def ingest(
             loaded_names = repository.loaded_file_names(table.source_system, table.source_table)
             files = select_incremental_files(select_source_files(Path(source_root), table), previous_watermark, loaded_names)
             frame, columns = read_source_files(spark, files, table, datetime.now(timezone.utc))
-            rows = write_bronze_run(frame, Path(destination_root), table, str(run_id))
+            rows, corrupt_rows = write_bronze_run(frame, Path(destination_root), table, str(run_id))
             watermark = source_file_watermark(files) or previous_watermark
             if not columns:
                 columns = previous_columns
-            repository.success(run_id, [path.name for path in files], rows, watermark, columns)
+            repository.success(run_id, [path.name for path in files], rows, corrupt_rows, watermark, columns)
             outcomes.append(RunOutcome(run_id, table.source_system, table.source_table, RunStatus.SUCCESS, rows))
         except Exception as exc:
             repository.fail(run_id, str(exc))
