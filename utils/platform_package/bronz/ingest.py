@@ -11,7 +11,7 @@ from pyspark.sql import SparkSession
 
 from .config import configured_source_tables
 from .run_log import RunLogRepository, RunStatus, connection_from_environment
-from .selector import select_source_files
+from .selector import select_incremental_files, select_source_files
 from .writer import read_source_files, write_bronze_run
 
 
@@ -56,7 +56,7 @@ def ingest(
     source_table: str | None = None,
     spark: SparkSession | None = None,
 ) -> list[RunOutcome]:
-    """Ingest all current Source Files of configured Source Tables and record each Run."""
+    """Ingest new Source Files of configured Source Tables and record each Run."""
     tables = configured_source_tables(source_table)
     repository = RunLogRepository(run_log_connection or connection_from_environment(), run_log_schema)
     repository.ensure_exists()
@@ -66,10 +66,14 @@ def ingest(
         run_id = uuid4()
         repository.start(run_id, table.source_system, table.source_table)
         try:
-            files = select_source_files(Path(source_root), table)
+            previous_watermark, previous_columns = repository.previous_success(table.source_system, table.source_table)
+            loaded_names = repository.loaded_file_names(table.source_system, table.source_table)
+            files = select_incremental_files(select_source_files(Path(source_root), table), previous_watermark, loaded_names)
             frame, columns = read_source_files(spark, files, table, datetime.now(timezone.utc))
             rows = write_bronze_run(frame, Path(destination_root), table, str(run_id))
-            watermark = source_file_watermark(files)
+            watermark = source_file_watermark(files) or previous_watermark
+            if not columns:
+                columns = previous_columns
             repository.success(run_id, [path.name for path in files], rows, watermark, columns)
             outcomes.append(RunOutcome(run_id, table.source_system, table.source_table, RunStatus.SUCCESS, rows))
         except Exception as exc:

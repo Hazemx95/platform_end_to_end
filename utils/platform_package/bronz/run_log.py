@@ -74,6 +74,28 @@ class RunLogRepository:
                 (str(run_id), source_system, source_table, RunStatus.RUNNING.value),
             )
 
+    def previous_success(self, source_system: str, source_table: str) -> tuple[datetime | None, list[str]]:
+        """Return the latest successful Run's Watermark and source columns."""
+        with self._cursor() as cursor:
+            cursor.execute(
+                sql.SQL("""SELECT watermark_value, schema_columns FROM {}
+                    WHERE source_system = %s AND source_table = %s AND status = %s
+                    ORDER BY finished_at DESC, run_id DESC LIMIT 1""").format(self.table),
+                (source_system, source_table, RunStatus.SUCCESS.value),
+            )
+            row = cursor.fetchone()
+            return (row[0], row[1] or []) if row else (None, [])
+
+    def loaded_file_names(self, source_system: str, source_table: str) -> set[str]:
+        """Names already recorded by any successful Run for this Source Table."""
+        with self._cursor() as cursor:
+            cursor.execute(
+                sql.SQL("""SELECT DISTINCT unnest(files_loaded) FROM {}
+                    WHERE source_system = %s AND source_table = %s AND status = %s""").format(self.table),
+                (source_system, source_table, RunStatus.SUCCESS.value),
+            )
+            return {row[0] for row in cursor.fetchall()}
+
     def success(self, run_id: UUID, files: list[str], rows: int, watermark: datetime | None, columns: list[str]):
         """Finish a Run with its Source Files, counts and reached Watermark."""
         with self._cursor() as cursor:

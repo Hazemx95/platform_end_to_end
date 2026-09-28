@@ -37,6 +37,214 @@ def run_log_rows(settings, schema, run_ids):
             return cursor.fetchall()
 
 
+def run_details(settings, schema, run_ids):
+    with psycopg2.connect(**settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("SELECT run_id, status, files_loaded, rows_written, watermark_value, schema_columns FROM {}.bronze_run_log WHERE run_id = ANY(%s::uuid[])").format(sql.Identifier(schema)),
+                ([str(run_id) for run_id in run_ids],),
+            )
+            return {str(row[0]): row[1:] for row in cursor.fetchall()}
+
+
+def test_idle_run_carries_watermark_and_schema_without_partition(tmp_path, spark, run_log_db):
+    settings, schema = run_log_db
+    source_root = tmp_path / "source"
+    destination = tmp_path / "bronze"
+    mtime_ns = 1_700_000_000_123_456_789
+    write_source_file(source_root, "source_crm", "cust_info", "first.csv", "id,name\n1,Ada\n", mtime_ns)
+
+    first = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+    idle = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+
+    assert (first.status, idle.status, idle.rows_written) == ("SUCCESS", "SUCCESS", 0)
+    details = run_details(settings, schema, [first.run_id, idle.run_id])
+    assert details[str(first.run_id)] == ("SUCCESS", ["first.csv"], 1, expected_watermark(mtime_ns), ["id", "name"])
+    assert details[str(idle.run_id)] == ("SUCCESS", [], 0, expected_watermark(mtime_ns), ["id", "name"])
+    table_root = destination / "source_crm" / "cust_info"
+    assert len(list(table_root.glob("_run_id=*"))) == 1
+    assert [(row["id"], row["_source_file"]) for row in spark.read.option("mergeSchema", "true").parquet(str(table_root)).collect()] == [("1", "first.csv")]
+
+
+def test_second_all_table_run_is_idle_without_new_partitions(tmp_path, spark, run_log_db):
+    settings, schema = run_log_db
+    source_root, destination = tmp_path / "source", tmp_path / "bronze"
+    tables = {
+        "source_crm": ("cust_info", "prd_info", "sales_details"),
+        "source_erp": ("CUST_AZ12", "LOC_A101", "PX_CAT_G1V2"),
+    }
+    mtime_ns = 1_700_000_000_123_456_789
+    for source_system, names in tables.items():
+        for name in names:
+            write_source_file(source_root, source_system, name, "delivery.csv", "id\n1\n", mtime_ns)
+
+    first = ingest(source_root, destination, settings, schema, spark=spark)
+    second = ingest(source_root, destination, settings, schema, spark=spark)
+
+    assert len(first) == len(second) == 6
+    assert all(run.status == "SUCCESS" for run in first + second)
+    details = run_details(settings, schema, [run.run_id for run in first + second])
+    for initial, idle in zip(first, second):
+        assert details[str(initial.run_id)] == ("SUCCESS", ["delivery.csv"], 1, expected_watermark(mtime_ns), ["id"])
+        assert details[str(idle.run_id)] == ("SUCCESS", [], 0, expected_watermark(mtime_ns), ["id"])
+        root = destination / initial.source_system / initial.source_table
+        assert len(list(root.glob("_run_id=*"))) == 1
+        assert [(row["id"], row["_source_file"]) for row in spark.read.option("mergeSchema", "true").parquet(str(root)).collect()] == [("1", "delivery.csv")]
+
+
+def test_new_source_file_only_advances_watermark(tmp_path, spark, run_log_db):
+    settings, schema = run_log_db
+    source_root, destination = tmp_path / "source", tmp_path / "bronze"
+    first_ns = 1_700_000_000_123_456_789
+    second_ns = first_ns + 2_000_000
+    write_source_file(source_root, "source_crm", "cust_info", "first.csv", "id\n1\n", first_ns)
+    first = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+    write_source_file(source_root, "source_crm", "cust_info", "second.csv", "id\n2\n", second_ns)
+
+    second = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+
+    assert second.status == "SUCCESS" and second.rows_written == 1
+    assert run_details(settings, schema, [second.run_id])[str(second.run_id)] == ("SUCCESS", ["second.csv"], 1, expected_watermark(second_ns), ["id"])
+    root = destination / "source_crm" / "cust_info"
+    assert len(list(root.glob("_run_id=*"))) == 2
+    assert {(row["id"], row["_source_file"], row["_run_id"]) for row in spark.read.option("mergeSchema", "true").parquet(str(root)).collect()} == {
+        ("1", "first.csv", str(first.run_id)), ("2", "second.csv", str(second.run_id))
+    }
+
+
+def test_touched_loaded_source_file_is_not_loaded_again(tmp_path, spark, run_log_db):
+    settings, schema = run_log_db
+    source_root, destination = tmp_path / "source", tmp_path / "bronze"
+    mtime_ns = 1_700_000_000_123_456_789
+    path = write_source_file(source_root, "source_crm", "cust_info", "first.csv", "id\n1\n", mtime_ns)
+    ingest(source_root, destination, settings, schema, "cust_info", spark)
+    os.utime(path, ns=(mtime_ns + 10_000_000, mtime_ns + 10_000_000))
+
+    idle = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+
+    assert run_details(settings, schema, [idle.run_id])[str(idle.run_id)] == ("SUCCESS", [], 0, expected_watermark(mtime_ns), ["id"])
+    root = destination / "source_crm" / "cust_info"
+    assert len(list(root.glob("_run_id=*"))) == 1
+    assert [(row["id"], row["_source_file"]) for row in spark.read.option("mergeSchema", "true").parquet(str(root)).collect()] == [("1", "first.csv")]
+
+
+def test_new_source_file_at_watermark_is_loaded(tmp_path, spark, run_log_db):
+    settings, schema = run_log_db
+    source_root, destination = tmp_path / "source", tmp_path / "bronze"
+    mtime_ns = 1_700_000_000_123_456_789
+    write_source_file(source_root, "source_crm", "cust_info", "first.csv", "id\n1\n", mtime_ns)
+    first = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+    assert first.status == "SUCCESS", first.error_message
+    write_source_file(source_root, "source_crm", "cust_info", "same-time.csv", "id\n2\n", mtime_ns)
+
+    second = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+
+    assert run_details(settings, schema, [second.run_id])[str(second.run_id)] == ("SUCCESS", ["same-time.csv"], 1, expected_watermark(mtime_ns), ["id"])
+    root = destination / "source_crm" / "cust_info"
+    assert len(list(root.glob("_run_id=*"))) == 2
+    assert {(row["id"], row["_source_file"]) for row in spark.read.option("mergeSchema", "true").parquet(str(root)).collect()} == {("1", "first.csv"), ("2", "same-time.csv")}
+
+
+def test_new_source_file_older_than_watermark_is_skipped(tmp_path, spark, run_log_db):
+    settings, schema = run_log_db
+    source_root, destination = tmp_path / "source", tmp_path / "bronze"
+    mtime_ns = 1_700_000_000_123_456_789
+    write_source_file(source_root, "source_crm", "cust_info", "first.csv", "id\n1\n", mtime_ns)
+    ingest(source_root, destination, settings, schema, "cust_info", spark)
+    write_source_file(source_root, "source_crm", "cust_info", "older.csv", "id\n2\n", mtime_ns - 1_000)
+
+    idle = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+
+    assert run_details(settings, schema, [idle.run_id])[str(idle.run_id)] == ("SUCCESS", [], 0, expected_watermark(mtime_ns), ["id"])
+    root = destination / "source_crm" / "cust_info"
+    assert len(list(root.glob("_run_id=*"))) == 1
+    assert [(row["id"], row["_source_file"]) for row in spark.read.option("mergeSchema", "true").parquet(str(root)).collect()] == [("1", "first.csv")]
+
+
+def test_two_source_files_within_one_microsecond_are_both_loaded(tmp_path, spark, run_log_db):
+    settings, schema = run_log_db
+    source_root, destination = tmp_path / "source", tmp_path / "bronze"
+    mtime_ns = 1_700_000_000_123_456_100
+    write_source_file(source_root, "source_crm", "cust_info", "first.csv", "id\n1\n", mtime_ns)
+    first = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+    write_source_file(source_root, "source_crm", "cust_info", "later.csv", "id\n2\n", mtime_ns + 899)
+
+    second = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+
+    assert run_details(settings, schema, [first.run_id, second.run_id])[str(second.run_id)] == ("SUCCESS", ["later.csv"], 1, expected_watermark(mtime_ns + 899), ["id"])
+    root = destination / "source_crm" / "cust_info"
+    assert len(list(root.glob("_run_id=*"))) == 2
+    assert {(row["id"], row["_source_file"]) for row in spark.read.option("mergeSchema", "true").parquet(str(root)).collect()} == {("1", "first.csv"), ("2", "later.csv")}
+
+
+def test_failed_run_does_not_advance_watermark_or_mark_source_file_loaded(tmp_path, spark, run_log_db):
+    settings, schema = run_log_db
+    source_root, destination = tmp_path / "source", tmp_path / "bronze"
+    first_ns = 1_700_000_000_123_456_000
+    second_ns = first_ns + 1_000_000
+    write_source_file(source_root, "source_crm", "cust_info", "first.csv", "id\n1\n", first_ns)
+    first = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+    write_source_file(source_root, "source_crm", "cust_info", "retry.csv", "id\n2\n", second_ns)
+    blocked_destination = tmp_path / "not-a-directory"
+    blocked_destination.write_text("blocked")
+
+    failed = ingest(source_root, blocked_destination, settings, schema, "cust_info", spark)[0]
+    retried = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+
+    assert failed.status == "FAILED"
+    details = run_details(settings, schema, [first.run_id, failed.run_id, retried.run_id])
+    assert details[str(first.run_id)][3] == expected_watermark(first_ns)
+    assert details[str(failed.run_id)] == ("FAILED", None, None, None, None)
+    assert details[str(retried.run_id)] == ("SUCCESS", ["retry.csv"], 1, expected_watermark(second_ns), ["id"])
+    root = destination / "source_crm" / "cust_info"
+    assert len(list(root.glob("_run_id=*"))) == 2
+    assert {(row["id"], row["_source_file"]) for row in spark.read.option("mergeSchema", "true").parquet(str(root)).collect()} == {("1", "first.csv"), ("2", "retry.csv")}
+
+
+def test_header_only_source_file_is_loaded_once_with_zero_rows(tmp_path, spark, run_log_db):
+    settings, schema = run_log_db
+    source_root, destination = tmp_path / "source", tmp_path / "bronze"
+    mtime_ns = 1_700_000_000_123_456_789
+    write_source_file(source_root, "source_crm", "cust_info", "header.csv", "id,name\n", mtime_ns)
+
+    first = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+    idle = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+
+    details = run_details(settings, schema, [first.run_id, idle.run_id])
+    assert details[str(first.run_id)] == ("SUCCESS", ["header.csv"], 0, expected_watermark(mtime_ns), ["id", "name"])
+    assert details[str(idle.run_id)] == ("SUCCESS", [], 0, expected_watermark(mtime_ns), ["id", "name"])
+    assert not list((destination / "source_crm" / "cust_info").glob("_run_id=*"))
+
+
+def test_zero_byte_source_file_is_loaded_once_without_columns(tmp_path, spark, run_log_db):
+    settings, schema = run_log_db
+    source_root, destination = tmp_path / "source", tmp_path / "bronze"
+    mtime_ns = 1_700_000_000_123_456_789
+    write_source_file(source_root, "source_crm", "cust_info", "empty.csv", "", mtime_ns)
+
+    first = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+    idle = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+
+    details = run_details(settings, schema, [first.run_id, idle.run_id])
+    assert details[str(first.run_id)] == ("SUCCESS", ["empty.csv"], 0, expected_watermark(mtime_ns), [])
+    assert details[str(idle.run_id)] == ("SUCCESS", [], 0, expected_watermark(mtime_ns), [])
+    assert not list((destination / "source_crm" / "cust_info").glob("_run_id=*"))
+
+
+def test_zero_byte_delivery_carries_previous_schema_columns(tmp_path, spark, run_log_db):
+    settings, schema = run_log_db
+    source_root, destination = tmp_path / "source", tmp_path / "bronze"
+    mtime_ns = 1_700_000_000_123_456_789
+    write_source_file(source_root, "source_crm", "cust_info", "first.csv", "id,name\n1,Ada\n", mtime_ns)
+    first = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+    write_source_file(source_root, "source_crm", "cust_info", "empty.csv", "", mtime_ns + 1_000)
+
+    empty = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+
+    details = run_details(settings, schema, [first.run_id, empty.run_id])
+    assert details[str(empty.run_id)] == ("SUCCESS", ["empty.csv"], 0, expected_watermark(mtime_ns + 1_000), ["id", "name"])
+
+
 def test_one_source_table_lands_in_bronze_with_run_log(tmp_path, spark, run_log_db):
     settings, schema = run_log_db
     source_root = tmp_path / "source"
