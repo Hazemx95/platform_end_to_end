@@ -48,6 +48,15 @@ def source_file_watermark(files: list[Path]) -> datetime | None:
     return datetime.fromtimestamp(seconds, tz=timezone.utc) + timedelta(microseconds=remaining)
 
 
+def schema_change(previous: list[str] | None, current: list[str]) -> dict[str, list[str]] | None:
+    """Describe changes in source columns relative to the previous successful Run."""
+    if previous is None:
+        return None
+    added = [name for name in current if name not in previous]
+    removed = [name for name in previous if name not in current]
+    return {"added": added, "removed": removed} if added or removed else None
+
+
 def ingest(
     source_root: Path | str = Path("datasets"),
     destination_root: Path | str = Path("Destination/bronze"),
@@ -73,8 +82,8 @@ def ingest(
             rows, corrupt_rows = write_bronze_run(frame, Path(destination_root), table, str(run_id))
             watermark = source_file_watermark(files) or previous_watermark
             if not columns:
-                columns = previous_columns
-            repository.success(run_id, [path.name for path in files], rows, corrupt_rows, watermark, columns)
+                columns = previous_columns or []
+            repository.success(run_id, [path.name for path in files], rows, corrupt_rows, watermark, columns, schema_change(previous_columns, columns))
             outcomes.append(RunOutcome(run_id, table.source_system, table.source_table, RunStatus.SUCCESS, rows))
         except Exception as exc:
             repository.fail(run_id, str(exc))

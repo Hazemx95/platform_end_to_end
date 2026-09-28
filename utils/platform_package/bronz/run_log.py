@@ -74,7 +74,7 @@ class RunLogRepository:
                 (str(run_id), source_system, source_table, RunStatus.RUNNING.value),
             )
 
-    def previous_success(self, source_system: str, source_table: str) -> tuple[datetime | None, list[str]]:
+    def previous_success(self, source_system: str, source_table: str) -> tuple[datetime | None, list[str] | None]:
         """Return the latest successful Run's Watermark and source columns."""
         with self._cursor() as cursor:
             cursor.execute(
@@ -84,7 +84,7 @@ class RunLogRepository:
                 (source_system, source_table, RunStatus.SUCCESS.value),
             )
             row = cursor.fetchone()
-            return (row[0], row[1] or []) if row else (None, [])
+            return (row[0], row[1] or []) if row else (None, None)
 
     def loaded_file_names(self, source_system: str, source_table: str) -> set[str]:
         """Names already recorded by any successful Run for this Source Table."""
@@ -96,14 +96,14 @@ class RunLogRepository:
             )
             return {row[0] for row in cursor.fetchall()}
 
-    def success(self, run_id: UUID, files: list[str], rows: int, corrupt_rows: int, watermark: datetime | None, columns: list[str]):
+    def success(self, run_id: UUID, files: list[str], rows: int, corrupt_rows: int, watermark: datetime | None, columns: list[str], change: dict[str, list[str]] | None):
         """Finish a Run with its Source Files, counts and reached Watermark."""
         with self._cursor() as cursor:
             cursor.execute(
                 sql.SQL("""UPDATE {} SET status = %s, finished_at = now(),
                     files_loaded = %s, rows_read = %s, rows_written = %s, corrupt_rows = %s,
-                    watermark_value = %s, schema_columns = %s WHERE run_id = %s""").format(self.table),
-                (RunStatus.SUCCESS.value, files, rows, rows, corrupt_rows, watermark, Json(columns), str(run_id)),
+                    watermark_value = %s, schema_columns = %s, schema_change = %s WHERE run_id = %s""").format(self.table),
+                (RunStatus.SUCCESS.value, files, rows, rows, corrupt_rows, watermark, Json(columns), Json(change) if change is not None else None, str(run_id)),
             )
 
     def fail(self, run_id: UUID, error: str):

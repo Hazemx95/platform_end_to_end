@@ -57,6 +57,148 @@ def run_corrupt_rows(settings, schema, run_ids):
             return {str(run_id): count for run_id, count in cursor.fetchall()}
 
 
+def run_schema(settings, schema, run_ids):
+    with psycopg2.connect(**settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("SELECT run_id, schema_columns, schema_change FROM {}.bronze_run_log WHERE run_id = ANY(%s::uuid[])").format(sql.Identifier(schema)),
+                ([str(run_id) for run_id in run_ids],),
+            )
+            return {str(run_id): (columns, change) for run_id, columns, change in cursor.fetchall()}
+
+
+def test_added_and_removed_columns_are_tracked_against_previous_success(tmp_path, spark, run_log_db):
+    settings, schema = run_log_db
+    source_root, destination = tmp_path / "source", tmp_path / "bronze"
+    base = 1_700_000_000_000_000_000
+    write_source_file(source_root, "source_crm", "sales_details", "first.csv", "sls_id,sls_amount\n1,10\n", base)
+    write_source_file(source_root, "source_crm", "cust_info", "first.csv", "cst_id,cst_marital_status\n1,Single\n", base)
+    for system, table in (("source_crm", "prd_info"), ("source_erp", "CUST_AZ12"), ("source_erp", "LOC_A101"), ("source_erp", "PX_CAT_G1V2")):
+        (source_root / system / table).mkdir(parents=True)
+    first = ingest(source_root, destination, settings, schema, spark=spark)
+    write_source_file(source_root, "source_crm", "sales_details", "second.csv", "sls_id,sls_amount,sls_discount\n2,20,3\n", base + 1_000_000)
+    write_source_file(source_root, "source_crm", "cust_info", "second.csv", "cst_id\n2\n", base + 1_000_000)
+
+    second = ingest(source_root, destination, settings, schema, spark=spark)
+
+    assert all(run.status == "SUCCESS" for run in first + second)
+    by_table = {run.source_table: run for run in second if run.source_table in ("sales_details", "cust_info")}
+    changes = run_schema(settings, schema, [run.run_id for run in first + second])
+    assert all(changes[str(run.run_id)][1] is None for run in first)
+    assert changes[str(by_table["sales_details"].run_id)] == (
+        ["sls_id", "sls_amount", "sls_discount"], {"added": ["sls_discount"], "removed": []},
+    )
+    assert changes[str(by_table["cust_info"].run_id)] == (
+        ["cst_id"], {"added": [], "removed": ["cst_marital_status"]},
+    )
+    sales = spark.read.option("mergeSchema", "true").parquet(str(destination / "source_crm" / "sales_details"))
+    assert {(row["sls_id"], row["sls_discount"]) for row in sales.collect()} == {("1", None), ("2", "3")}
+    customers = spark.read.option("mergeSchema", "true").parquet(str(destination / "source_crm" / "cust_info"))
+    assert {(row["cst_id"], row["cst_marital_status"]) for row in customers.collect()} == {("1", "Single"), ("2", None)}
+
+
+def test_unchanged_and_idle_runs_have_null_schema_change(tmp_path, spark, run_log_db):
+    settings, schema = run_log_db
+    source_root, destination = tmp_path / "source", tmp_path / "bronze"
+    base = 1_700_000_000_000_000_000
+    write_source_file(source_root, "source_crm", "cust_info", "first.csv", "id,name\n1,Ada\n", base)
+    first = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+    write_source_file(source_root, "source_crm", "cust_info", "second.csv", "name,id\nLin,2\n", base + 1_000_000)
+    unchanged = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+    idle = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+
+    assert all(run.status == "SUCCESS" for run in (first, unchanged, idle))
+    assert run_schema(settings, schema, [first.run_id, unchanged.run_id, idle.run_id]) == {
+        str(run.run_id): (columns, None)
+        for run, columns in ((first, ["id", "name"]), (unchanged, ["name", "id"]), (idle, ["name", "id"]))
+    }
+    bronze = spark.read.option("mergeSchema", "true").parquet(str(destination / "source_crm" / "cust_info"))
+    assert {(row["id"], row["name"]) for row in bronze.collect()} == {("1", "Ada"), ("2", "Lin")}
+
+
+def test_mixed_headers_use_sorted_file_order_and_union_by_name(tmp_path, spark, run_log_db):
+    settings, schema = run_log_db
+    source_root, destination = tmp_path / "source", tmp_path / "bronze"
+    base = 1_700_000_000_000_000_000
+    write_source_file(source_root, "source_crm", "sales_details", "z.csv", "sls_id,sls_amount\n2,20\n", base)
+    write_source_file(source_root, "source_crm", "sales_details", "a.csv", "sls_discount,sls_id\n5,1\n", base + 1_000_000)
+
+    run = ingest(source_root, destination, settings, schema, "sales_details", spark)[0]
+
+    assert run.status == "SUCCESS", run.error_message
+    assert run_schema(settings, schema, [run.run_id])[str(run.run_id)] == (["sls_discount", "sls_id", "sls_amount"], None)
+    bronze = spark.read.option("mergeSchema", "true").parquet(str(destination / "source_crm" / "sales_details"))
+    assert {(row["sls_id"], row["sls_amount"], row["sls_discount"]) for row in bronze.collect()} == {
+        ("1", None, "5"), ("2", "20", None),
+    }
+
+
+def test_renamed_column_is_one_removal_and_one_addition(tmp_path, spark, run_log_db):
+    settings, schema = run_log_db
+    source_root, destination = tmp_path / "source", tmp_path / "bronze"
+    base = 1_700_000_000_000_000_000
+    write_source_file(source_root, "source_crm", "cust_info", "first.csv", "id,old_name\n1,Ada\n", base)
+    first = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+    write_source_file(source_root, "source_crm", "cust_info", "second.csv", "id,new_name\n2,Lin\n", base + 1_000_000)
+
+    renamed = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+
+    assert first.status == renamed.status == "SUCCESS"
+    assert run_schema(settings, schema, [renamed.run_id])[str(renamed.run_id)] == (
+        ["id", "new_name"], {"added": ["new_name"], "removed": ["old_name"]},
+    )
+    bronze = spark.read.option("mergeSchema", "true").parquet(str(destination / "source_crm" / "cust_info"))
+    assert {(row["id"], row["old_name"], row["new_name"]) for row in bronze.collect()} == {
+        ("1", "Ada", None), ("2", None, "Lin"),
+    }
+
+
+def test_header_names_are_preserved_without_trimming(tmp_path, spark, run_log_db):
+    settings, schema = run_log_db
+    source_root, destination = tmp_path / "source", tmp_path / "bronze"
+    write_source_file(source_root, "source_crm", "cust_info", "spaces.csv", " id ,name\n1,Ada\n", 1_700_000_000_000_000_000)
+
+    run = ingest(source_root, destination, settings, schema, "cust_info", spark)[0]
+
+    assert run.status == "SUCCESS", run.error_message
+    assert run_schema(settings, schema, [run.run_id])[str(run.run_id)] == ([" id ", "name"], None)
+    bronze = spark.read.option("mergeSchema", "true").parquet(str(destination / "source_crm" / "cust_info"))
+    assert " id " in bronze.columns
+    assert [(row[" id "], row["name"]) for row in bronze.collect()] == [("1", "Ada")]
+
+
+@pytest.mark.parametrize("header,offending", [
+    ("cst_id, CST_ID", ("cst_id", " CST_ID")),
+    ("cst_id,_source_file", ("_source_file",)),
+])
+def test_ambiguous_or_reserved_header_fails_only_its_source_table(tmp_path, spark, run_log_db, header, offending):
+    settings, schema = run_log_db
+    source_root, destination = tmp_path / "source", tmp_path / "bronze"
+    base = 1_700_000_000_000_000_000
+    write_source_file(source_root, "source_crm", "cust_info", "a.csv", "cst_id\n0\n", base)
+    write_source_file(source_root, "source_crm", "cust_info", "bad.csv", f"{header}\n1,Ada\n", base)
+    write_source_file(source_root, "source_crm", "prd_info", "good.csv", "id\n2\n", base)
+    for system, table in (("source_crm", "sales_details"), ("source_erp", "CUST_AZ12"), ("source_erp", "LOC_A101"), ("source_erp", "PX_CAT_G1V2")):
+        (source_root / system / table).mkdir(parents=True)
+
+    outcomes = ingest(source_root, destination, settings, schema, spark=spark)
+
+    bad = next(run for run in outcomes if run.source_table == "cust_info")
+    good = next(run for run in outcomes if run.source_table == "prd_info")
+    assert bad.status == "FAILED"
+    assert "bad.csv" in bad.error_message
+    assert all(name in bad.error_message for name in offending)
+    assert good.status == "SUCCESS", good.error_message
+    with psycopg2.connect(**settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(sql.SQL("SELECT status, error_message FROM {}.bronze_run_log WHERE run_id = %s").format(sql.Identifier(schema)), (str(bad.run_id),))
+            assert cursor.fetchone() == ("FAILED", bad.error_message)
+    assert run_schema(settings, schema, [good.run_id])[str(good.run_id)] == (["id"], None)
+    bronze = spark.read.option("mergeSchema", "true").parquet(str(destination / "source_crm" / "prd_info"))
+    assert [row["id"] for row in bronze.collect()] == ["2"]
+    assert not (destination / "source_crm" / "cust_info").exists()
+
+
 def test_malformed_source_row_is_kept_and_counted_in_successful_run(tmp_path, spark, run_log_db):
     settings, schema = run_log_db
     source_root, destination = tmp_path / "source", tmp_path / "bronze"
@@ -94,6 +236,10 @@ def test_idle_run_carries_watermark_and_schema_without_partition(tmp_path, spark
     details = run_details(settings, schema, [first.run_id, idle.run_id])
     assert details[str(first.run_id)] == ("SUCCESS", ["first.csv"], 1, expected_watermark(mtime_ns), ["id", "name"])
     assert details[str(idle.run_id)] == ("SUCCESS", [], 0, expected_watermark(mtime_ns), ["id", "name"])
+    assert run_schema(settings, schema, [first.run_id, idle.run_id]) == {
+        str(first.run_id): (["id", "name"], None),
+        str(idle.run_id): (["id", "name"], None),
+    }
     assert run_corrupt_rows(settings, schema, [first.run_id, idle.run_id]) == {
         str(first.run_id): 0, str(idle.run_id): 0,
     }
@@ -264,6 +410,9 @@ def test_zero_byte_source_file_is_loaded_once_without_columns(tmp_path, spark, r
     details = run_details(settings, schema, [first.run_id, idle.run_id])
     assert details[str(first.run_id)] == ("SUCCESS", ["empty.csv"], 0, expected_watermark(mtime_ns), [])
     assert details[str(idle.run_id)] == ("SUCCESS", [], 0, expected_watermark(mtime_ns), [])
+    assert run_schema(settings, schema, [first.run_id, idle.run_id]) == {
+        str(first.run_id): ([], None), str(idle.run_id): ([], None),
+    }
     assert not list((destination / "source_crm" / "cust_info").glob("_run_id=*"))
 
 
@@ -279,6 +428,7 @@ def test_zero_byte_delivery_carries_previous_schema_columns(tmp_path, spark, run
 
     details = run_details(settings, schema, [first.run_id, empty.run_id])
     assert details[str(empty.run_id)] == ("SUCCESS", ["empty.csv"], 0, expected_watermark(mtime_ns + 1_000), ["id", "name"])
+    assert run_schema(settings, schema, [empty.run_id])[str(empty.run_id)] == (["id", "name"], None)
 
 
 def test_one_source_table_lands_in_bronze_with_run_log(tmp_path, spark, run_log_db):

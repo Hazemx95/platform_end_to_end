@@ -14,9 +14,20 @@ def read_source_files(spark: SparkSession, files: list[Path], table: SourceTable
     """Read each Source File with its own string schema, preserving malformed text."""
     combined = None
     columns = []
-    for path in files:
+    headers = []
+    for path in sorted(files, key=lambda file: file.name):
         with path.open(newline="", encoding="utf-8-sig") as handle:
             header = next(csv.reader(handle), [])
+        seen = {}
+        for name in header:
+            if name.startswith("_"):
+                raise ValueError(f"Source File {path.name}: reserved header {name!r} starts with '_'")
+            key = name.strip().casefold()
+            if key in seen:
+                raise ValueError(f"Source File {path.name}: colliding headers {seen[key]!r} and {name!r}")
+            seen[key] = name
+        headers.append((path, header))
+    for path, header in headers:
         if not header:
             continue
         columns.extend(name for name in header if name not in columns)
